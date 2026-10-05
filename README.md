@@ -20,6 +20,9 @@ Qwen3-ASR 的 CPU + GPU 推理服务与命令行工具，使用 C/C++17 实现�
 - **字幕对齐**: 使用 Qwen3-ForcedAligner 生成词级时间戳
 - **流式分段**: 长音频流式推理，分段输出
 - **VAD 段式批量**: Silero VAD 自动分段 + 静音检测 + softcap 截止
+- **热词/自定义词表**: 离线 + 实时均支持。两条机制可叠加:
+  - `--prompt` 上下文提示(官方 Qwen3-ASR context 机制,写进 system prompt)
+  - `--hotwords` token 概率偏置(对正在匹配的热词前缀的下一个 token 加 logit 偏置,不改模型)
 
 ## 构建
 
@@ -111,6 +114,11 @@ export QASR_TRANSLATION_TIMEOUT_MS=3000                   # 翻译超时(ms)
 qasr_cli --model-dir /path/to/Qwen3-ASR-0.6B --audio audio.wav
 qasr_cli --model-dir /path/to/Qwen3-ASR-0.6B --audio meeting.mp3 --language Chinese --threads 8
 qasr_cli --model-dir /path/to/Qwen3-ASR-1.7B --audio movie.mp3 --output-format srt --output movie.srt
+
+# 热词:prompt 上下文方式(官方机制,流式同样生效)
+qasr_cli --model-dir ... --audio a.wav --stream --prompt "Devin, RayRemote, vLLM"
+# 热词:token 概率偏置方式(--hotword-bias 为概率倍率,默认 2.0)
+qasr_cli --model-dir ... --audio a.wav --stream --hotwords "Devin,RayRemote,vLLM" --hotword-bias 5
 ```
 
 ### HTTP API
@@ -123,6 +131,28 @@ curl -X POST http://localhost:8080/v1/chat/completions -H "Content-Type: applica
 ```
 
 完整 API 端点见 [`docs/API.md`](docs/API.md)。
+
+## 热词 (Hotwords)
+
+两种机制,可同时使用,**离线和实时(流式)都生效**:
+
+| 机制 | 入口 | 原理 | 特点 |
+|---|---|---|---|
+| prompt 上下文 | `--prompt` / 会话 `prompt`/`instructions` 字段 | 文本注入 chat template 的 system 段(官方 Qwen3-ASR context) | 模型自行理解词汇语义,效果最好;专有名词拼写修正强 |
+| logit 偏置 | `--hotwords` CSV / 会话 `hotwords` 字段 + `--hotword-bias` 倍率 | 解码时对"正在匹配中的热词序列"的下一 token 加 `log(倍率)` 偏置(KMP 前缀匹配) | 不依赖模型理解,确定性提升;普通词不会误触发,建议只放稀有词 |
+
+Realtime 会话级用法:
+
+```bash
+# POST /api/realtime/start
+{"prompt": "Devin, RayRemote, vLLM", "hotwords": "Devin,RayRemote"}
+# POST /v1/realtime (OpenAI 兼容)
+{"type":"session.create","session":{"prompt":"...","hotwords":"..."}}
+# POST /api/capture/start (本机采集)
+{"prompt":"...","hotwords":"..."}
+```
+
+经验值(0.6B, Apple Silicon 实测):`--hotword-bias` 2 对"高置信误识别"够用(如 Devon→Devin);5~20 才压得动模型确信的读法;即使 20 也不会污染正常语音(机制只抬升热词序列的下一个 token)。混合大小写热词(如 "RayRemote")若 tokenizer 拆开,偏置无法合并输出成连写——此时 prompt 机制更合适。
 
 ## 配置
 
@@ -137,6 +167,9 @@ curl -X POST http://localhost:8080/v1/chat/completions -H "Content-Type: applica
 | `--ui-dir` | `ui` | UI 静态资源 |
 | `--threads` | 0=auto | 推理线程 |
 | `--temperature` | -1.0=auto | 采样温度 |
+| `--prompt` | (空) | realtime/capture 会话默认系统提示词(热词上下文) |
+| `--hotwords` | (空) | 热词列表,逗号分隔(logit 偏置机制) |
+| `--hotword-bias` | 2.0 | 热词概率倍率 |
 | `--verbosity` | 0 | 日志级别 |
 
 ### 环境变量

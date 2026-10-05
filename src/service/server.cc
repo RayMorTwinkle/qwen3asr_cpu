@@ -265,6 +265,22 @@ Status ParseOpenAiRealtimeRequest(std::string_view body, OpenAiRealtimeRequest *
         request->language = session->value("language", std::string());
     }
 
+    request->prompt = json_body.value("prompt", std::string());
+    if (request->prompt.empty() && session != nullptr) {
+        request->prompt = session->value("prompt", std::string());
+    }
+    if (request->prompt.empty() && session != nullptr) {
+        request->prompt = session->value("instructions", std::string());
+    }
+    if (request->prompt.empty()) {
+        request->prompt = json_body.value("instructions", std::string());
+    }
+
+    request->hotwords = json_body.value("hotwords", std::string());
+    if (request->hotwords.empty() && session != nullptr) {
+        request->hotwords = session->value("hotwords", std::string());
+    }
+
     request->input_audio_format = json_body.value("input_audio_format", std::string());
     if (request->input_audio_format.empty() && session != nullptr) {
         request->input_audio_format = session->value("input_audio_format", std::string());
@@ -1607,6 +1623,11 @@ struct RealtimeSession {
     std::string id;
     std::string model;
     std::string language;
+    /* Per-session system prompt + hotword CSV (resolved at create
+     * time: request value else server default).  Immutable for the
+     * session's life — safe to read without holding mu. */
+    std::string prompt;
+    std::string hotwords;
     std::vector<float> samples;
     std::vector<float> full_audio;       /* untrimmed — for post-stop reconciliation */
     std::size_t total_samples = 0;
@@ -2199,6 +2220,10 @@ struct HostCaptureSession {
     std::string id;
     std::string backend;
     std::string device;
+    /* System prompt / hotword CSV applied to the capture decode
+     * (resolved at start: request body else server default). */
+    std::string prompt;
+    std::string hotwords;
     std::vector<float> samples;
     std::vector<float> full_audio;
     std::size_t total_samples = 0;
@@ -3255,6 +3280,41 @@ Status ParseServerArguments(int argc, const char * const argv[], ServerConfig * 
             ++index;
             continue;
         }
+        if (arg == "--prompt") {
+            const char * value = nullptr;
+            Status status = RequireValue(argc, argv, index, "--prompt", &value);
+            if (!status.ok()) {
+                return status;
+            }
+            config->prompt = value;
+            ++index;
+            continue;
+        }
+        if (arg == "--hotwords") {
+            const char * value = nullptr;
+            Status status = RequireValue(argc, argv, index, "--hotwords", &value);
+            if (!status.ok()) {
+                return status;
+            }
+            config->hotwords = value;
+            ++index;
+            continue;
+        }
+        if (arg == "--hotword-bias") {
+            const char * value = nullptr;
+            Status status = RequireValue(argc, argv, index, "--hotword-bias", &value);
+            if (!status.ok()) {
+                return status;
+            }
+            float bias = 0.0f;
+            if (sscanf(value, "%f", &bias) != 1 || bias <= 0.0f) {
+                return Status(StatusCode::kInvalidArgument,
+                              "--hotword-bias must be a positive float (probability multiplier)");
+            }
+            config->hotword_bias = bias;
+            ++index;
+            continue;
+        }
         return Status(StatusCode::kInvalidArgument, "unknown argument: " + std::string(arg));
     }
 
@@ -3283,6 +3343,10 @@ std::string BuildServerUsage(std::string_view program_name) {
     usage += "                           1=commit/summary, 2=per-poll, 3=raw\n";
     usage += "  --quiet, -q              alias for --verbosity 0\n";
     usage += "  --temperature <float>  (default: auto, 0=greedy, >0=sampling)\n";
+    usage += "  --prompt <text>        default system prompt for realtime/capture sessions\n";
+    usage += "                         (also usable per-request: prompt/instructions field)\n";
+    usage += "  --hotwords <a,b,c>     hotword list for logit boosting (comma-separated)\n";
+    usage += "  --hotword-bias <f>     hotword probability multiplier (default: 2.0)\n";
     usage += "  --backend cpu|cuda     (default: cpu)\n";
     usage += "  --no-fallback          fail if requested backend unavailable\n";
     usage += "  -h, --help\n";
@@ -5275,7 +5339,9 @@ int RunServer(const ServerConfig & config) {
                 RT_LOG("AsrWorkerLoop sid=%s END (set_force_language failed)", session->id.c_str());
                 return;
             }
-            if (qwen_set_prompt(live_ctx, nullptr) != 0) {
+            if (qwen_set_prompt(live_ctx,
+                                session->prompt.empty() ? nullptr
+                                                        : session->prompt.c_str()) != 0) {
                 std::lock_guard<std::mutex> lock(session->mu);
                 session->error = "failed to set realtime prompt";
                 session->worker_done = true;
@@ -5283,13 +5349,27 @@ int RunServer(const ServerConfig & config) {
                 RT_LOG("AsrWorkerLoop sid=%s END (set_prompt failed)", session->id.c_str());
                 return;
             }
+            if (!session->hotwords.empty()) {
+                float hwb = config.hotword_bias > 0.0f ? config.hotword_bias : 2.0f;
+                if (qwen_set_hotwords(live_ctx, session->hotwords.c_str(),
+                                      logf(hwb)) != 0) {
+                    std::lock_guard<std::mutex> lock(session->mu);
+                    session->error = "failed to set realtime hotwords";
+                    session->worker_done = true;
+                    qwen_free(live_ctx);
+                    RT_LOG("AsrWorkerLoop sid=%s END (set_hotwords failed)", session->id.c_str());
+                    return;
+                }
+            }
         } else if (facade) {
             /* GPU path: acquire persistent engine session for this realtime session. */
             AsrEngine * eng = facade->engine();
             if (eng) {
                 qasr::SessionOptions gpuOpts;
                 gpuOpts.language = forced_language;
-                gpuOpts.prompt = "";
+                gpuOpts.prompt = session->prompt;
+                gpuOpts.hotwords = session->hotwords;
+                gpuOpts.hotword_bias = config.hotword_bias;
                 gpuOpts.temperature = facade->temperature();
                 gpuOpts.realtime = true;
                 if (eng->CreateSession(gpuOpts, gpuSessionId).ok()) {
@@ -5940,6 +6020,8 @@ int RunServer(const ServerConfig & config) {
         const float stream_chunk_sec = RealtimeStreamChunkSeconds(realtime_policy);
         const int stream_max_new_tokens = RealtimeStreamMaxNewTokens(realtime_policy);
         const int verbosity = realtime_model->verbosity();
+        const float capture_hotword_bias = config.hotword_bias > 0.0f
+            ? config.hotword_bias : 2.0f;
 
         worker->thread = std::thread([
             capture,
@@ -5947,6 +6029,7 @@ int RunServer(const ServerConfig & config) {
             live_ctx,
             stream_chunk_sec,
             stream_max_new_tokens,
+            capture_hotword_bias,
             verbosity]() {
             qwen_verbose = verbosity;
             live_ctx->segment_sec = 30.0f;
@@ -5954,12 +6037,24 @@ int RunServer(const ServerConfig & config) {
             live_ctx->stream_chunk_sec = stream_chunk_sec;
             live_ctx->stream_max_new_tokens = stream_max_new_tokens;
 
-            if (qwen_set_prompt(live_ctx, nullptr) != 0) {
+            const char * cap_prompt = capture->prompt.empty() ? nullptr
+                                                              : capture->prompt.c_str();
+            if (qwen_set_prompt(live_ctx, cap_prompt) != 0) {
                 std::lock_guard<std::mutex> lock(capture->mu);
                 capture->error = "failed to set capture prompt";
                 capture->worker_done = true;
                 qwen_free(live_ctx);
                 return;
+            }
+            if (!capture->hotwords.empty()) {
+                if (qwen_set_hotwords(live_ctx, capture->hotwords.c_str(),
+                                      logf(capture_hotword_bias)) != 0) {
+                    std::lock_guard<std::mutex> lock(capture->mu);
+                    capture->error = "failed to set capture hotwords";
+                    capture->worker_done = true;
+                    qwen_free(live_ctx);
+                    return;
+                }
             }
 
             std::function<void(const qwen_stream_chunk_t *)> chunk_callback = [&capture](const qwen_stream_chunk_t * chunk) {
@@ -6013,6 +6108,8 @@ int RunServer(const ServerConfig & config) {
 
     auto CreateRealtimeSession = [&](std::string model_id,
                                      std::string language,
+                                     std::string prompt,
+                                     std::string hotwords,
                                      RealtimeSessionSnapshot * created) -> Status {
         if (created == nullptr) {
             return Status(StatusCode::kInvalidArgument, "created session output must not be null");
@@ -6023,6 +6120,10 @@ int RunServer(const ServerConfig & config) {
         session->id = std::to_string(session_counter.fetch_add(1));
         session->model = std::move(model_id);
         session->language = std::move(language);
+        /* Per-request values win; fall back to the server-wide
+         * --prompt / --hotwords defaults. */
+        session->prompt = prompt.empty() ? config.prompt : std::move(prompt);
+        session->hotwords = hotwords.empty() ? config.hotwords : std::move(hotwords);
         RT_LOG("CreateRealtimeSession sid=%s allocated", session->id.c_str());
 
         {
@@ -6218,6 +6319,8 @@ int RunServer(const ServerConfig & config) {
              std::string sid = session_id;
              std::string lang = session->language;
              std::vector<float> audioCopy = session->full_audio;
+             const float rec_hotword_bias = config.hotword_bias > 0.0f
+                 ? config.hotword_bias : 2.0f;
              std::string vadText;
              {
                  std::lock_guard<std::mutex> lock(session->mu);
@@ -6227,7 +6330,7 @@ int RunServer(const ServerConfig & config) {
                  }
              }
       std::thread([ssn, sid, lang, bm = batch_model, audioCopy = std::move(audioCopy),
-                             vadText = std::move(vadText)]() mutable {
+                             rec_hotword_bias, vadText = std::move(vadText)]() mutable {
                     InferHandle rHandle = bm->createInferHandle();
                     qwen_ctx_t * reconcile_ctx = rHandle.nativeCtx;
                   if (reconcile_ctx && audioCopy.size() > 1024) {
@@ -6239,7 +6342,13 @@ int RunServer(const ServerConfig & config) {
                       if (!lang.empty()) {
                           qwen_set_force_language(reconcile_ctx, lang.c_str());
                       }
-                      qwen_set_prompt(reconcile_ctx, nullptr);
+                      if (!ssn->prompt.empty()) {
+                          qwen_set_prompt(reconcile_ctx, ssn->prompt.c_str());
+                      }
+                      if (!ssn->hotwords.empty()) {
+                          qwen_set_hotwords(reconcile_ctx, ssn->hotwords.c_str(),
+                                            logf(rec_hotword_bias));
+                      }
 
                       char * raw = qwen_transcribe_audio(reconcile_ctx,
                           audioCopy.data(),
@@ -6880,7 +6989,9 @@ int RunServer(const ServerConfig & config) {
         const std::string model_id = realtime_request.model.empty() ? served_model_id : realtime_request.model;
         if (realtime_request.action == OpenAiRealtimeAction::kSessionCreate) {
             RealtimeSessionSnapshot session;
-            const Status status = CreateRealtimeSession(model_id, realtime_request.language, &session);
+            const Status status = CreateRealtimeSession(model_id, realtime_request.language,
+                                                        realtime_request.prompt,
+                                                        realtime_request.hotwords, &session);
             if (!status.ok()) {
                 SetErrorResponse(response, status, StatusToHttpCode(status));
                 return;
@@ -6937,10 +7048,28 @@ int RunServer(const ServerConfig & config) {
                 realtime_policy));
     });
 
-    server.Post("/api/realtime/start", [&](const HttpRequest &, HttpResponse & response) {
+    server.Post("/api/realtime/start", [&](const HttpRequest & request, HttpResponse & response) {
         RT_LOG("HTTP POST /api/realtime/start enter");
+        /* Optional JSON body: {"prompt": ..., "instructions": ...,
+         * "hotwords": "a,b,c", "language": ...}.  Missing/empty body
+         * falls back to server --prompt/--hotwords defaults. */
+        std::string start_prompt;
+        std::string start_hotwords;
+        std::string start_language;
+        if (!request.body.empty()) {
+            Json body = Json::parse(request.body);
+            if (!body.is_discarded() && body.is_object()) {
+                start_prompt = body.value("prompt", std::string());
+                if (start_prompt.empty()) {
+                    start_prompt = body.value("instructions", std::string());
+                }
+                start_hotwords = body.value("hotwords", std::string());
+                start_language = body.value("language", std::string());
+            }
+        }
         RealtimeSessionSnapshot session;
-        const Status status = CreateRealtimeSession(served_model_id, "", &session);
+        const Status status = CreateRealtimeSession(served_model_id, start_language,
+                                                    start_prompt, start_hotwords, &session);
         RT_LOG("HTTP POST /api/realtime/start CreateRealtimeSession returned ok=%d sid=%s", status.ok() ? 1 : 0, session.id.c_str());
         if (!status.ok()) {
             SetErrorResponse(response, status, StatusToHttpCode(status));
@@ -7434,11 +7563,18 @@ int RunServer(const ServerConfig & config) {
 
         std::string backend = "auto";
         std::string device;
+        std::string cap_prompt;
+        std::string cap_hotwords;
         if (!request.body.empty()) {
             Json body = Json::parse(request.body);
             if (!body.is_discarded() && body.is_object()) {
                 backend = body.value("backend", backend);
                 device = body.value("device", device);
+                cap_prompt = body.value("prompt", std::string());
+                if (cap_prompt.empty()) {
+                    cap_prompt = body.value("instructions", std::string());
+                }
+                cap_hotwords = body.value("hotwords", std::string());
             }
         }
         if (request.has_param("backend")) {
@@ -7460,6 +7596,8 @@ int RunServer(const ServerConfig & config) {
         capture->id = std::to_string(session_counter.fetch_add(1));
         capture->device = device;
         capture->backend = selected_backend;
+        capture->prompt = cap_prompt.empty() ? config.prompt : cap_prompt;
+        capture->hotwords = cap_hotwords.empty() ? config.hotwords : cap_hotwords;
 
 #if defined(_WIN32)
         const Status spawn_status = SpawnCaptureProcess(argv, &capture->child_process, &capture->read_handle);
