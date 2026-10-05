@@ -543,7 +543,7 @@ int qwen_was_cancelled(const qwen_ctx_t *ctx);
 int qwen_set_prompt(qwen_ctx_t *ctx, const char *prompt);
 
 /* Set optional hotword list and logit bias (UTF-8, comma/semicolon/
- * newline separated, e.g. "Devin, RayRemote, vLLM").  While a
+ * newline separated, e.g. "Zentrix, RayRemote, vLLM").  While a
  * hotword's token prefix is being matched during decode, the token
  * that would continue the match gets +bias added to its logit
  * (a probability multiplier of m corresponds to bias = logf(m)).

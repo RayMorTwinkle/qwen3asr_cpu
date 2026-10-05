@@ -971,8 +971,8 @@ static int prepare_prompt_tokens(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer) {
 
 /* Lazily tokenize the CSV hotword list into candidate token sequences.
  * Each term is encoded twice — once bare and once with a leading
- * space — so both sentence-initial ("Devin works well") and
- * mid-sentence ("I used Devin") surface forms are boosted.  Called
+ * space — so both sentence-initial ("Zentrix works well") and
+ * mid-sentence ("I used Zentrix") surface forms are boosted.  Called
  * from prepare_prompt_tokens, which is the one place a tokenizer is
  * guaranteed to be in scope; results are cached on the ctx. */
 static int prepare_hotword_tokens(qwen_ctx_t *ctx, qwen_tokenizer_t *tokenizer) {

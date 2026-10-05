@@ -116,9 +116,9 @@ qasr_cli --model-dir /path/to/Qwen3-ASR-0.6B --audio meeting.mp3 --language Chin
 qasr_cli --model-dir /path/to/Qwen3-ASR-1.7B --audio movie.mp3 --output-format srt --output movie.srt
 
 # 热词:prompt 上下文方式(官方机制,流式同样生效)
-qasr_cli --model-dir ... --audio a.wav --stream --prompt "Devin, RayRemote, vLLM"
+qasr_cli --model-dir ... --audio a.wav --stream --prompt "Zentrix, RayRemote, vLLM"
 # 热词:token 概率偏置方式(--hotword-bias 为概率倍率,默认 2.0)
-qasr_cli --model-dir ... --audio a.wav --stream --hotwords "Devin,RayRemote,vLLM" --hotword-bias 5
+qasr_cli --model-dir ... --audio a.wav --stream --hotwords "Zentrix,RayRemote,vLLM" --hotword-bias 5
 ```
 
 ### HTTP API
@@ -145,21 +145,21 @@ Realtime 会话级用法:
 
 ```bash
 # POST /api/realtime/start
-{"prompt": "Devin, RayRemote, vLLM", "hotwords": "Devin,RayRemote"}
+{"prompt": "Zentrix, RayRemote, vLLM", "hotwords": "Zentrix,RayRemote"}
 # POST /v1/realtime (OpenAI 兼容)
 {"type":"session.create","session":{"prompt":"...","hotwords":"..."}}
 # POST /api/capture/start (本机采集)
 {"prompt":"...","hotwords":"..."}
 ```
 
-经验值(0.6B, Apple Silicon 实测):`--hotword-bias` 2 对"高置信误识别"够用(如 Devon→Devin);5~20 才压得动模型确信的读法;即使 20 也不会污染正常语音(机制只抬升热词序列的下一个 token)。混合大小写热词(如 "RayRemote")若 tokenizer 拆开,偏置无法合并输出成连写——此时 prompt 机制更合适。
+经验值(0.6B, Apple Silicon 实测):`--hotword-bias` 2 对"高置信误识别"够用(如 Ray Remote→RayRemote);5~20 才压得动模型确信的读法;即使 20 也不会污染正常语音(机制只抬升热词序列的下一个 token)。混合大小写热词(如 "RayRemote")若 tokenizer 拆开,偏置无法合并输出成连写——此时 prompt 机制更合适。
 
 ### 推荐用法:按"词的常见度"选通道
 
 - **常见词、或含常见子词的词 → 放 prompt**(`Pro`、`AI`、`Ray Remote` 这类):prompt 靠语义理解起作用,词越常见模型越认识;而 logit 偏置给常见词全力推会误伤正常语音。
-- **冷门词/生造词 → 放 hotwords**(`Devin`、`秘塔搜索`、自造品牌名):模型本来就猜不到,偏置把它抬出来,确定性强、不依赖理解。
+- **冷门词/生造词 → 放 hotwords**(`Zentrix`、`秘塔搜索`、自造品牌名):模型本来就猜不到,偏置把它抬出来,确定性强、不依赖理解。
 - 两者可叠加,互不干扰。词表大(几百词)时 hotwords 零开销;prompt 超过几百词会让每段解码多花 ~1.5s prefill 且效果稀释,精简到最重要的几十个。
-- 判断一个词"常见还是冷门"的快速办法:看它 tokenize 成几个 token、首 token 编号大不大——单 token 且编号 < ~30000 的基本是常见词(如 `" Pro"=1298`);多 token 或编号 >60000 的偏冷门(`" Devin"=79992`)。
+- 判断一个词"常见还是冷门"的快速办法:看它 tokenize 成几个 token、首 token 编号大不大——单 token 且编号 < ~30000 的基本是常见词(如 `" Pro"=1298`);多 token 或编号 >60000 的偏冷门(`"秘"=99780`)。
 - 偏置机制内置保护:单 token 低编号词的首 token 偏置按 `id/60000` 自动衰减(常见词 ≈ 没推),且每个 token 最多只补到刚好超过当前第一名(margin cap)。词表大/脏时建议 bias ≤ 20。
 
 ### 热词对延时的影响(0.6B, Apple M4 实测, `--stream`)

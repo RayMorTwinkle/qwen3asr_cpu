@@ -816,8 +816,8 @@ static void ensure_dec_buffers(qwen_ctx_t *ctx) {
  * Two self-regulating guards keep large hotword lists safe:
  *  - rarity attenuation: a single-token sequence whose token has a
  *    low BPE id is a common word (" Pro"=1298); BPE merge order is a
- *    frequency proxy, so its depth-0 boost is attenuated by id/30000.
- *    Multi-token sequences and high-id tokens (" Devin"=79992) keep
+ *    frequency proxy, so its depth-0 boost is attenuated by id/60000.
+ *    Multi-token sequences and high-id tokens ("秘"=99780) keep
  *    full boost — the sequence structure already guards them.
  *  - margin cap: the applied boost is capped at (top logit - token
  *    logit + eps), so a boosted token can at most just overtake the
