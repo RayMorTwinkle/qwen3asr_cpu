@@ -162,6 +162,17 @@ Realtime 会话级用法:
 - 判断一个词"常见还是冷门"的快速办法:看它 tokenize 成几个 token、首 token 编号大不大——单 token 且编号 < ~30000 的基本是常见词(如 `" Pro"=1298`);多 token 或编号 >60000 的偏冷门(`" Devin"=79992`)。
 - 偏置机制内置保护:单 token 低编号词的首 token 偏置按 `id/60000` 自动衰减(常见词 ≈ 没推),且每个 token 最多只补到刚好超过当前第一名(margin cap)。词表大/脏时建议 bias ≤ 20。
 
+### 热词对延时的影响(0.6B, Apple M4 实测, `--stream`)
+
+| 配置 | decode 总耗时(4.8s 音频) | 说明 |
+|---|---|---|
+| baseline | 623 ms | — |
+| prompt 3 词 / hotwords 3 词 | 647 / 625 ms | 噪声内,无感 |
+| prompt 300 词 | 2406 ms(3.9x) | 每段重 prefill ~600 token |
+| hotwords 300 词 | 693 ms | +11%,仍零感 |
+
+15s 多句音频同样趋势:prompt 300 词 decode 5.1s(2.9x),hotwords 300 词与 baseline 相同。感知延迟 ≈ 每句话说完到出字的时间,prompt 大词表每段约多 1s——**一般热词表只有几十个词,两种机制在流式下延时都感知不到,可以放心叠用**。
+
 ## 配置
 
 ### qasr_server
