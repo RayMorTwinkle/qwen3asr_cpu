@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 
 /* ========================================================================
  * Weight Loading
@@ -811,18 +812,52 @@ static void ensure_dec_buffers(qwen_ctx_t *ctx) {
  * starting the word at all; deeper tokens are only boosted inside a
  * live match, so common sub-tokens ("in", "Ray") never get boosted
  * out of context.
+ *
+ * Two self-regulating guards keep large hotword lists safe:
+ *  - rarity attenuation: a single-token sequence whose token has a
+ *    low BPE id is a common word (" Pro"=1298); BPE merge order is a
+ *    frequency proxy, so its depth-0 boost is attenuated by id/30000.
+ *    Multi-token sequences and high-id tokens (" Devin"=79992) keep
+ *    full boost — the sequence structure already guards them.
+ *  - margin cap: the applied boost is capped at (top logit - token
+ *    logit + eps), so a boosted token can at most just overtake the
+ *    current argmax — it can never be pushed to an extreme logit that
+ *    snowballs into repetition loops.
  */
 static int hotwords_active(const qwen_ctx_t *ctx) {
     return ctx->n_hotword_seqs > 0 && ctx->hotword_bias != 0.0f;
 }
 
+static float hotword_first_scale(const qwen_ctx_t *ctx, int h) {
+    int id = ctx->hotword_seqs[h][0];
+    int len = ctx->hotword_seq_lens[h];
+    float s = (float)id / 60000.0f;
+    if (s > 1.0f) s = 1.0f;
+    /* Multi-token sequences get a floor: the sequence structure itself
+     * is a rarity signal, and coined compounds often START with a
+     * common prefix token ("De", "Ray") that still deserves a nudge.
+     * Single-token sequences get no floor — a low-id single token is
+     * just a common word and boosting it unconditionally is what
+     * turns large lists into hotword soup. */
+    if (len >= 2 && s < 0.3f) s = 0.3f;
+    if (s < 0.02f) s = 0.02f;
+    return s;
+}
+
 static void hotword_apply_bias(qwen_ctx_t *ctx) {
+    float top = -FLT_MAX;
+    for (int v = 0; v < ctx->config.vocab_size; v++) {
+        if (ctx->dec_logits_buf[v] > top) top = ctx->dec_logits_buf[v];
+    }
     for (int h = 0; h < ctx->n_hotword_seqs; h++) {
         int d = ctx->hotword_seq_depth[h];
         int tid = ctx->hotword_seqs[h][d];
-        if (tid >= 0 && tid < ctx->config.vocab_size) {
-            ctx->dec_logits_buf[tid] += ctx->hotword_bias;
-        }
+        if (tid < 0 || tid >= ctx->config.vocab_size) continue;
+        float b = ctx->hotword_bias;
+        if (d == 0) b *= hotword_first_scale(ctx, h);
+        float need = top - ctx->dec_logits_buf[tid] + 1e-3f;
+        float add = b < need ? b : need;
+        if (add > 0.0f) ctx->dec_logits_buf[tid] += add;
     }
 }
 
