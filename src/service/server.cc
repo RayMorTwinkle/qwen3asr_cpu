@@ -979,6 +979,12 @@ public:
         backendKind_ = config.backend;
         backendFallback_ = false;
 
+        /* --threads 真正生效点：qwen 线程池默认 n_threads=1，CLI 走
+         * model_bridge 时会 qwen_set_threads，服务端从没调过 → 全程单核
+         * 解码，M1 上慢 ~10-20 倍。引擎加载前先把全局池拉起来。 */
+        const int pool_threads = config.threads > 0 ? config.threads : qwen_get_num_cpus();
+        qwen_set_threads(pool_threads);
+
         V2EngineConfig engCfg;
         engCfg.model_dir = config.model_dir;
         engCfg.threads = config.threads;
