@@ -735,6 +735,11 @@ struct TranscriptionApiOptions {
     std::string model;
     std::string prompt;
     std::string language;
+    /* Hotword logit boosting for batch transcription (same semantics as
+     * realtime session.hotwords): CSV term list + probability multiplier
+     * (0 = engine/CLI default). */
+    std::string hotwords;
+    float hotword_bias = 0.0f;
     TranscriptionResponseFormat response_format = TranscriptionResponseFormat::kJson;
     bool stream = false;
     bool want_segment_timestamps = false;
@@ -757,6 +762,16 @@ Status ParseTranscriptionApiOptions(const HttpRequest & request, TranscriptionAp
     }
     if (TryGetFormField(request, "language", &field_value)) {
         options->language = field_value;
+    }
+    if (TryGetFormField(request, "hotwords", &field_value)) {
+        options->hotwords = field_value;
+    }
+    if (TryGetFormField(request, "hotword_bias", &field_value)) {
+        char * endp = nullptr;
+        const float parsed = std::strtof(field_value.c_str(), &endp);
+        if (endp != field_value.c_str() && parsed > 0.0f) {
+            options->hotword_bias = parsed;
+        }
     }
     if (TryGetFormField(request, "response_format", &field_value)) {
         Status status = ParseTranscriptionResponseFormat(field_value, &options->response_format);
@@ -820,6 +835,8 @@ struct ChatCompletionRequestOptions {
     std::string prompt;
     std::string language;
     std::string audio_locator;
+    std::string hotwords;
+    float hotword_bias = 0.0f;
     bool stream = false;
 };
 
@@ -837,6 +854,13 @@ Status ParseChatCompletionRequest(const HttpRequest & request, ChatCompletionReq
     options->model = body.value("model", std::string());
     options->stream = body.value("stream", false);
     options->language = body.value("language", std::string());
+    options->hotwords = body.value("hotwords", std::string());
+    if (body.contains("hotword_bias") && body["hotword_bias"].is_number()) {
+        const float parsed_bias = body["hotword_bias"].get<float>();
+        if (parsed_bias > 0.0f) {
+            options->hotword_bias = parsed_bias;
+        }
+    }
     if (body.contains("extra_body") && body["extra_body"].is_object()) {
         options->language = body["extra_body"].value("language", options->language);
     }
@@ -894,6 +918,8 @@ Status ParseChatCompletionRequest(const HttpRequest & request, ChatCompletionReq
 struct ModelDecodeOptions {
     std::string prompt;
     std::string language;
+    std::string hotwords;
+    float hotword_bias = 0.0f;
     int stream_max_new_tokens = 32;
     float stream_chunk_sec = 0.0f;
     float temperature = -1.0f;
@@ -1101,6 +1127,13 @@ private:
             result.status = Status(StatusCode::kInvalidArgument, "failed to set prompt");
             return result;
         }
+        if (!decode.hotwords.empty()) {
+            const float hwb = decode.hotword_bias > 0.0f ? decode.hotword_bias : 2.0f;
+            if (qwen_set_hotwords(ctx, decode.hotwords.c_str(), logf(hwb)) != 0) {
+                result.status = Status(StatusCode::kInvalidArgument, "failed to set hotwords");
+                return result;
+            }
+        }
         if (qwen_set_force_language(ctx, decode.language.empty() ? nullptr : decode.language.c_str()) != 0) {
             result.status = Status(StatusCode::kInvalidArgument,
                                    "unsupported language: " + decode.language);
@@ -1112,18 +1145,42 @@ private:
                                 token_cb ? &token_cb : nullptr);
         qwen_set_cancel_callback(ctx, cancel_cb ? ForwardCancelRequest : nullptr,
                                  cancel_cb ? &cancel_cb : nullptr);
-        char * raw = qwen_transcribe(ctx, audio_path.string().c_str());
+        /* Segmented path: 温度回退 + 熵/复读质量守卫。裸 qwen_transcribe()
+         * 一路解码到 EOS 不设防——M1 上贪心解码会进入复读循环，跑一次
+         * block-repeat breaker 前耗时 ~20 倍（5.3s 音频 75s vs CLI 3.2s）。 */
+        int n_samples = 0;
+        float * samples = qwen_load_wav(audio_path.string().c_str(), &n_samples);
+        if (!samples) {
+            qwen_set_cancel_callback(ctx, nullptr, nullptr);
+            qwen_set_token_callback(ctx, nullptr, nullptr);
+            result.status = Status(StatusCode::kInternal, "failed to load audio input");
+            return result;
+        }
+        qwen_segment_result_t * seg_result =
+            qwen_transcribe_audio_segmented(ctx, samples, n_samples);
+        std::free(samples);
         bool was_cancelled = qwen_was_cancelled(ctx) != 0;
         qwen_set_cancel_callback(ctx, nullptr, nullptr);
         qwen_set_token_callback(ctx, nullptr, nullptr);
-        if (!raw) {
+        if (!seg_result) {
             result.status = was_cancelled
                 ? Status(StatusCode::kFailedPrecondition, "transcription cancelled")
                 : Status(StatusCode::kInternal, "transcription failed");
             return result;
         }
-        result.text = raw;
-        std::free(raw);
+        std::string full_text;
+        for (int i = 0; i < seg_result->n_segments; ++i) {
+            const qwen_timed_segment_t & seg = seg_result->segments[i];
+            TimedSegment ts;
+            ts.text = seg.text ? seg.text : "";
+            ts.range.begin_ms = static_cast<std::int64_t>(seg.start_sec * 1000.0f);
+            ts.range.end_ms = static_cast<std::int64_t>(seg.end_sec * 1000.0f);
+            result.segments.push_back(std::move(ts));
+            if (!full_text.empty()) full_text += ' ';
+            full_text += result.segments.back().text;
+        }
+        qwen_segment_result_free(seg_result);
+        result.text = std::move(full_text);
         result.total_ms = ctx->perf_total_ms;
         result.audio_ms = ctx->perf_audio_ms;
         result.text_tokens = ctx->perf_text_tokens;
@@ -1148,6 +1205,13 @@ private:
         if (qwen_set_prompt(ctx, decode.prompt.empty() ? nullptr : decode.prompt.c_str()) != 0) {
             result.status = Status(StatusCode::kInvalidArgument, "failed to set prompt");
             return result;
+        }
+        if (!decode.hotwords.empty()) {
+            const float hwb = decode.hotword_bias > 0.0f ? decode.hotword_bias : 2.0f;
+            if (qwen_set_hotwords(ctx, decode.hotwords.c_str(), logf(hwb)) != 0) {
+                result.status = Status(StatusCode::kInvalidArgument, "failed to set hotwords");
+                return result;
+            }
         }
         if (qwen_set_force_language(ctx, decode.language.empty() ? nullptr : decode.language.c_str()) != 0) {
             result.status = Status(StatusCode::kInvalidArgument,
@@ -1200,6 +1264,8 @@ private:
             SessionOptions opts;
             opts.language = decode.language;
             opts.prompt = decode.prompt;
+            opts.hotwords = decode.hotwords;
+            opts.hotword_bias = decode.hotword_bias;
             if (decode.temperature >= 0.0f) {
                 opts.temperature = decode.temperature;
             } else if (config_.temperature >= 0.0f) {
@@ -1233,6 +1299,8 @@ private:
         SessionOptions opts;
         opts.language = decode.language;
         opts.prompt = decode.prompt;
+        opts.hotwords = decode.hotwords;
+        opts.hotword_bias = decode.hotword_bias;
         if (decode.temperature >= 0.0f) {
             opts.temperature = decode.temperature;
         } else if (config_.temperature >= 0.0f) {
@@ -6526,6 +6594,8 @@ int RunServer(const ServerConfig & config) {
         ModelDecodeOptions decode;
         decode.prompt = options.prompt;
         decode.language = options.language;
+        decode.hotwords = options.hotwords;
+        decode.hotword_bias = options.hotword_bias;
         const AsrRunResult result = batch_model->TranscribeFile(prepared.wav_path, decode);
         CleanupPreparedAudio(&prepared);
         if (!result.status.ok()) {
@@ -6597,6 +6667,8 @@ int RunServer(const ServerConfig & config) {
             ModelDecodeOptions decode;
             decode.prompt = options.prompt;
             decode.language = options.language;
+            decode.hotwords = options.hotwords;
+            decode.hotword_bias = options.hotword_bias;
             decode.cancel_callback = [cancel_flag]() {
                 return cancel_flag && cancel_flag->load();
             };
@@ -6903,6 +6975,8 @@ int RunServer(const ServerConfig & config) {
         ModelDecodeOptions decode;
         decode.prompt = options.prompt;
         decode.language = options.language;
+        decode.hotwords = options.hotwords;
+        decode.hotword_bias = options.hotword_bias;
         const AsrRunResult result = batch_model->TranscribeFile(prepared.wav_path, decode);
         CleanupPreparedAudio(&prepared);
         if (!result.status.ok()) {
@@ -6945,6 +7019,8 @@ int RunServer(const ServerConfig & config) {
         ModelDecodeOptions decode;
         decode.prompt = options.prompt;
         decode.language = options.language;
+        decode.hotwords = options.hotwords;
+        decode.hotword_bias = options.hotword_bias;
         const AsrRunResult result = batch_model->TranscribeFile(prepared.wav_path, decode);
         CleanupPreparedAudio(&prepared);
         if (!result.status.ok()) {
